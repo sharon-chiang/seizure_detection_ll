@@ -10,6 +10,7 @@ pip install -e .
 ## Minimal working example
 ### Assumes your LFP dataframe is named lfp_df_SC38
 
+```
 from seizure_detection_ll import seizure_detector_LL_shortlongtrend
 import matplotlib.pyplot as plt
 import numpy as np
@@ -64,6 +65,7 @@ for s, e, flag in zip(win_start, win_end, seiz_mask):
 
 plt.tight_layout()
 plt.show()
+```
 
 
 
