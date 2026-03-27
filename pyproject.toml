@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "seizure-detection-ll"
+version = "0.1.0"
+description = "Line-length short/long window seizure detector for multichannel LFP data"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+  {name = "Sharon Chiang"}
+]
+dependencies = [
+  "numpy>=1.24",
+  "pandas>=2.0",
+]
