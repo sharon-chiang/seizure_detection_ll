@@ -1,21 +1,26 @@
 # seizure-detection-ll
 
-This code implements line-length short/long window seizure detector for multiple channel LFP data. 
+Line-length short/long window detectors for seizures and interictal spikes in multiple channel LFP recordings.
 
 ## Install
+
 ```bash
 pip install -e .
 ```
 
 ## Minimal working example
-### Assumes your LFP dataframe is named lfp_df_SC38
 
-```
-from seizure_detection_ll import seizure_detector_LL_shortlongtrend
+Assumes your LFP dataframe is named `lfp_df_SC38`, with timestamps (seconds) as rows and channels as columns.
+
+```python
+from seizure_detection_ll import (
+    seizure_detector_LL_shortlongtrend,
+    spike_detector_LL_shortlongtrend,
+)
 import matplotlib.pyplot as plt
-import numpy as np
 
-results = seizure_detector_LL_shortlongtrend(
+# Seizure detection
+seizures = seizure_detector_LL_shortlongtrend(
     lfp_df=lfp_df_SC38,
     lfp_sample_rate=1000,
     short_window_size_sec=1,
@@ -24,49 +29,54 @@ results = seizure_detector_LL_shortlongtrend(
     ratio_threshold=1.5,
     num_channels=5,
     duration_threshold_sec=10,
+    max_gap_sec=1,
 )
 
-X = lfp_df_SC38.to_numpy(dtype=float)
-time_vals = np.asarray(lfp_df_SC38.index, dtype=float)
-
-spike_window_df = results["spike_window_df"].copy()
-
-channel_range = np.nanpercentile(X, 99) - np.nanpercentile(X, 1)
-offset_step = channel_range * 0.8 if channel_range > 0 else 1000
-
-fig, (ax1, ax2) = plt.subplots(
-    2, 1, figsize=(18, 12), sharex=True,
-    gridspec_kw={"height_ratios": [3, 1]}
+# Interictal spike detection
+spikes = spike_detector_LL_shortlongtrend(
+    lfp_df=lfp_df_SC38,
+    lfp_sample_rate=1000,
+    seizure_intervals_df=seizures["seizure_intervals_df"],
+    short_window_size_sec=0.05,
+    long_window_size_sec=60,
+    percent_overlap=50,
+    ratio_threshold=1.5,
+    max_derivative_threshold=75000,
+    amplitude_threshold=150,
+    num_channels=5,
 )
 
-for i, col in enumerate(lfp_df_SC38.columns):
-    ax1.plot(time_vals, X[:, i] + i * offset_step, linewidth=0.5)
+# Detected event intervals
+seizure_intervals_df = seizures["seizure_intervals_df"]
+spike_intervals_df = spikes["spike_intervals_df"]
 
-ax1.set_title("LFP traces")
+print("Seizures:", len(seizure_intervals_df))
+print("Spikes:", len(spike_intervals_df))
+```
 
-ax2.plot(
-    spike_window_df["window_center_time"],
-    spike_window_df["n_channels_above_threshold"],
-    linewidth=1.5,
-)
-ax2.axhline(results["params"]["num_channels"], linestyle="--")
-ax2.set_xlabel("Time")
-ax2.set_ylabel("# channels > threshold")
-ax2.set_title("LL detector")
+## Visualization
 
-seiz_mask = spike_window_df["seizure_window"].fillna(False).to_numpy()
-win_start = np.asarray(spike_window_df["window_start_time"], dtype=float)
-win_end = np.asarray(spike_window_df["window_end_time"], dtype=float)
+Plot the number of channels exceeding the seizure LL threshold.
 
-for s, e, flag in zip(win_start, win_end, seiz_mask):
-    if flag:
-        ax1.axvspan(s, e, alpha=0.2)
-        ax2.axvspan(s, e, alpha=0.2)
+```python
+w = seizures["spike_window_df"]
 
+fig, ax = plt.subplots(figsize=(14, 4))
+ax.plot(w["window_center_time"], w["n_channels_above_threshold"])
+ax.axhline(5, linestyle="--", color="gray", label="Channel threshold")
+
+for _, event in seizure_intervals_df.iterrows():
+    ax.axvspan(event["start_time"], event["end_time"], color="red", alpha=0.2)
+
+ax.set(xlabel="Time (s)", ylabel="# channels above threshold",
+       title="Line-length seizure detection")
 plt.tight_layout()
 plt.show()
 ```
 
+## Detection methods
 
+- **Seizures:** Short/long line-length ratio exceeding a threshold across a minimum number of channels, sustained for a minimum duration. Short gaps between qualifying windows permitted.
+- **Interictal spikes:** Separate line-length ratio, max derivative, and peak to peak amplitude thresholds across a minimum number of channels. Windows overlapping detected seizures must be pre-excluded.
 
-
+Thresholds should be adjusted for the recording. Amplitude thresholds should be in LFP units (presumed uV). Derivative thresholds should be in those units per second.
