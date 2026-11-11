@@ -1,5 +1,131 @@
 import numpy as np
 import pandas as pd
+from scipy.ndimage import uniform_filter1d, maximum_filter1d, minimum_filter1d
+
+
+"""Line-length-based seizure and interictal spike detection.
+"""
+
+def _ll_window_features(
+    lfp_df, lfp_sample_rate, short_window_size_sec,
+    long_window_size_sec, percent_overlap, spikes=False,
+    channel_batch_size=8
+):
+    """Compute LL ratios and spike features. LFP time stamps should be in seconds. 
+    """
+    n_time, n_channels = lfp_df.shape
+    short_n = max(2, int(round(short_window_size_sec * lfp_sample_rate)))
+    long_n = max(2, int(round(long_window_size_sec * lfp_sample_rate)))
+    hop = max(1, int(round(short_n * (1 - percent_overlap / 100))))
+
+    if n_time < long_n:
+        raise ValueError(f"Need at least {long_n} samples to calculate long window")
+
+    starts = np.arange(0, n_time - short_n + 1, hop)
+    valid = starts >= long_n
+    short_centers = starts + (short_n - 1) // 2
+    long_centers = starts[valid] - long_n + (long_n - 1) // 2
+    n_windows = len(starts)
+    has_valid = valid.any()
+    amp_centers = starts + short_n // 2 if spikes else None
+
+    short_ll = np.empty((n_windows, n_channels))
+    long_ll = np.full((n_windows, n_channels), np.nan)
+    ratio = np.full((n_windows, n_channels), np.nan)
+    deriv = np.empty((n_windows, n_channels)) if spikes else None
+    amp = np.empty((n_windows, n_channels)) if spikes else None
+    X = lfp_df.to_numpy(copy=False)
+
+    for a in range(0, n_channels, channel_batch_size):
+        b = min(a + channel_batch_size, n_channels)
+        x = np.ascontiguousarray(X[:, a:b], dtype=np.float64)
+        diff = np.abs(np.diff(x, axis=0))
+        bad_diff = ~np.isfinite(diff)
+        has_bad_diff = bad_diff.any()
+
+        if has_bad_diff:
+            diff[bad_diff] = 0
+
+        s = uniform_filter1d(
+            diff, size=short_n - 1, axis=0
+        )[short_centers]
+
+        if has_valid:
+            l = uniform_filter1d(
+                diff, size=long_n - 1, axis=0
+            )[long_centers]
+
+        if has_bad_diff:
+            bad_s = maximum_filter1d(
+                bad_diff, size=short_n - 1, axis=0
+            )[short_centers]
+            s[bad_s] = np.nan
+
+            if has_valid:
+                bad_l = maximum_filter1d(
+                    bad_diff, size=long_n - 1, axis=0
+                )[long_centers]
+                l[bad_l] = np.nan
+
+        short_ll[:, a:b] = s
+
+        if has_valid:
+            long_ll[valid, a:b] = l
+            ratio[valid, a:b] = s[valid] / (l + 1e-12)
+
+        if spikes:
+            d = maximum_filter1d(
+                diff, size=short_n - 1, axis=0
+            )[short_centers] * lfp_sample_rate
+
+            if has_bad_diff:
+                d[bad_s] = np.nan
+
+            deriv[:, a:b] = d
+
+            bad_x = ~np.isfinite(x)
+            if bad_x.any():
+                x[bad_x] = 0
+
+            a_vals = (
+                maximum_filter1d(
+                    x, size=short_n, axis=0
+                )[amp_centers]
+                - minimum_filter1d(
+                    x, size=short_n, axis=0
+                )[amp_centers]
+            )
+
+            if bad_x.any():
+                bad_amp = maximum_filter1d(
+                    bad_x, size=short_n, axis=0
+                )[amp_centers]
+                a_vals[bad_amp] = np.nan
+
+            amp[:, a:b] = a_vals
+
+    return starts, short_n, hop, valid, short_ll, long_ll, ratio, deriv, amp
+
+
+def _event_intervals(mask, starts, short_n, index_vals, lfp_sample_rate):
+    """Collect consecutive windows into event intervals."""
+    changes = np.diff(np.r_[False, mask, False].astype(np.int8))
+    first = np.flatnonzero(changes == 1)
+    last = np.flatnonzero(changes == -1) - 1
+
+    if len(first) == 0:
+        return pd.DataFrame()
+
+    return pd.DataFrame({
+        "start_window_idx": first,
+        "end_window_idx": last,
+        "start_time": index_vals[starts[first]],
+        "end_time": index_vals[starts[last] + short_n - 1],
+        "duration_sec": (
+            starts[last] - starts[first] + short_n
+        ) / lfp_sample_rate,
+    })
+
 
 def seizure_detector_LL_shortlongtrend(
     lfp_df,
@@ -7,165 +133,209 @@ def seizure_detector_LL_shortlongtrend(
     short_window_size_sec=1,
     long_window_size_sec=60,
     percent_overlap=50,
-    ratio_threshold=0.5,
+    ratio_threshold=1.5,
     num_channels=5,
-    duration_threshold_sec=10.0,
+    duration_threshold_sec=10,
+    max_gap_sec=1,
+    channel_batch_size=8,
 ):
+    """LL seizure detector
     """
-    Implement line length detector that 1) compute short window LL and long window LL for every channel
-    2) computes ratio = short_LL / long_LL
-    3) mark a shots window as having a spike if ratio exceeds threshold in at least num_channels channels (spike detection)
-    4) mark a candidate seizure if consecutive windows have sepikes for duration_threshold_sec( (seizure detector)
+    (
+        starts, short_n, hop, valid,
+        short_ll, long_ll, ratio, _, _
+    ) = _ll_window_features(
+        lfp_df,
+        lfp_sample_rate,
+        short_window_size_sec,
+        long_window_size_sec,
+        percent_overlap,
+        channel_batch_size=channel_batch_size,
+    )
 
-    Inputs
-    ----------
-    lfp_df : pd.DataFrame
-        Rows are time points, columns are channels. Requires that lfp_df.index is timestamps. If not, need to update code. 
-    lfp_sample_rate : float
-        Sampling frequency in Hz.
-    short_window_size_sec : float
-        Short-term window size in seconds.
-    long_window_size_sec : float
-        Long-term window size in seconds.
-    percent_overlap : float
-        Percent overlap for both short and long windows.
-    ratio_threshold : float
-        Direct threshold for short_LL / long_LL.
-    num_channels : int
-        Minimum number of channels exceeding ratio threshold
-        for a short window to count as spike-positive.
-    duration_threshold_sec : float
-        Require spike-positive windows for this many consecutive seconds.
+    n_above = np.count_nonzero(ratio > ratio_threshold, axis=1)
+    candidate = (n_above >= num_channels) & valid
 
-    Ouputs
-    -------
-    results : dict
+    step_sec = hop / lfp_sample_rate
+    duration_windows = max(
+        1, int(np.ceil(duration_threshold_sec / step_sec))
+    )
+    max_gap_windows = max(
+        0, int(np.floor(max_gap_sec / step_sec))
+    )
+
+    seizure_window = np.zeros(len(starts), dtype=bool)
+    consecutive_count = np.zeros(len(starts), dtype=int)
+
+    run_start = last_positive = None
+    n_positive = gap_len = 0
+
+    for i, positive in enumerate(candidate):
+        if positive:
+            if run_start is None:
+                run_start = i
+                n_positive = 0
+
+            last_positive = i
+            n_positive += 1
+            gap_len = 0
+
+        elif run_start is not None:
+            gap_len += 1
+
+            if gap_len > max_gap_windows:
+                if n_positive >= duration_windows:
+                    seizure_window[
+                        run_start:last_positive + 1
+                    ] = True
+
+                run_start = last_positive = None
+                n_positive = gap_len = 0
+
+        consecutive_count[i] = n_positive
+
+    if run_start is not None and n_positive >= duration_windows:
+        seizure_window[run_start:last_positive + 1] = True
+
+    index_vals = np.asarray(lfp_df.index)
+    start_time = index_vals[starts]
+    end_time = index_vals[starts + short_n - 1]
+    center_time = (start_time + end_time) / 2
+    window_index = pd.Index(
+        center_time, name="window_center_time"
+    )
+
+    return {
+        "ratio_df": pd.DataFrame(
+            ratio, index=window_index, columns=lfp_df.columns
+        ),
+        "short_ll_df": pd.DataFrame(
+            short_ll, index=window_index, columns=lfp_df.columns
+        ),
+        "long_ll_df": pd.DataFrame(
+            long_ll, index=window_index, columns=lfp_df.columns
+        ),
+        "spike_window_df": pd.DataFrame({
+            "window_start_sample": starts,
+            "window_end_sample": starts + short_n - 1,
+            "window_start_time": start_time,
+            "window_end_time": end_time,
+            "window_center_time": center_time,
+            "valid_long_window": valid,
+            "n_channels_above_threshold": n_above,
+            "spike_window": candidate,
+            "consecutive_spike_windows": consecutive_count,
+            "seizure_window": seizure_window,
+        }),
+        "seizure_intervals_df": _event_intervals(
+            seizure_window,
+            starts,
+            short_n,
+            index_vals,
+            lfp_sample_rate,
+        ),
+    }
+
+
+def spike_detector_LL_shortlongtrend(
+    lfp_df,
+    lfp_sample_rate,
+    seizure_intervals_df,
+    short_window_size_sec=0.05,
+    long_window_size_sec=60,
+    percent_overlap=50,
+    ratio_threshold=1.5,
+    max_derivative_threshold=75000,
+    amplitude_threshold=150,
+    num_channels=5,
+    channel_batch_size=4,
+):
+    """LL interictal spike detector. Requires (1) channel must exceed the LL ratio, (2) maximum absolute derivative threshold, (3) peak-to-peak amplitude thresholds in the same short window.
+    Note: Make sure to pre-exclude seizures by running seizure detector before this. 
     """
+    (
+        starts, short_n, _, valid,
+        short_ll, long_ll, ratio, deriv, amp
+    ) = _ll_window_features(
+        lfp_df,
+        lfp_sample_rate,
+        short_window_size_sec,
+        long_window_size_sec,
+        percent_overlap,
+        spikes=True,
+        channel_batch_size=channel_batch_size,
+    )
 
-    X = lfp_df.to_numpy(dtype=float)  
-    n_time, n_channels_total = X.shape
+    above_ratio = ratio > ratio_threshold
+    above_deriv = deriv > max_derivative_threshold
+    above_amp = amp > amplitude_threshold
 
-    # Calculate number of samples requires in the short window and long window
-    short_window_samples = max(2, int(round(short_window_size_sec * lfp_sample_rate)))
-    long_window_samples = max(2, int(round(long_window_size_sec * lfp_sample_rate)))
+    n_ratio = np.count_nonzero(above_ratio, axis=1)
+    n_deriv = np.count_nonzero(above_deriv, axis=1)
+    n_amp = np.count_nonzero(above_amp, axis=1)
 
-    # How many samples to move each shrt window forward based on sliding window overlap
-    short_hop_samples = max(1, int(round(short_window_samples * (1.0 - percent_overlap / 100.0))))
+    n_meeting = np.count_nonzero(
+        above_ratio & above_deriv & above_amp,
+        axis=1,
+    )
 
-    if n_time < long_window_samples:
-        raise ValueError(f"Need at least {long_window_samples} samples to calculate long window")
+    index_vals = np.asarray(lfp_df.index)
+    start_time = index_vals[starts]
+    end_time = index_vals[starts + short_n - 1]
+    center_time = (start_time + end_time) / 2
+    window_index = pd.Index(
+        center_time, name="window_center_time"
+    )
 
-    # Get starting points of short windows
-    short_window_starts = np.arange(0, n_time - short_window_samples + 1, short_hop_samples)
-    n_short_windows = len(short_window_starts)
+    seizure_window = np.zeros(len(starts), dtype=bool)
 
-    # Initialize arrays to store short window LL and long window LL
-    short_ll = np.empty((n_short_windows, n_channels_total))
-    long_ll = np.empty((n_short_windows, n_channels_total))
+    for _, row in seizure_intervals_df.iterrows():
+        seizure_window |= (
+            (start_time <= row["end_time"])
+            & (end_time >= row["start_time"])
+        )
 
-    # Some arrays don't have long enough time to also have a long window. True if also can calculate a long window
-    valid_mask = np.zeros(n_short_windows, dtype=bool)
+    spike_window = (
+        (n_meeting >= num_channels)
+        & valid
+        & ~seizure_window
+    )
 
-    # Calculate line length for hsort and long windows
-    for i, s_start in enumerate(short_window_starts):
-        s_end = s_start + short_window_samples 
-
-        short_seg = X[s_start:s_end, :]
-        short_ll[i, :] = np.mean(np.abs(np.diff(short_seg, axis=0)), axis=0)
-        
-        l_end = s_end
-        l_start = l_end - long_window_samples
-
-        if l_start >= 0:
-            long_seg = X[l_start:l_end, :]
-            long_ll[i, :] = np.mean(np.abs(np.diff(long_seg, axis=0)), axis=0)
-            valid_mask[i] = True
-        else:
-            long_ll[i, :] = np.nan
-
-    # Calculate ratio and make it nan if no long window 
-    ratio_short_long = short_ll / (long_ll + 1e-12)
-    ratio_short_long[~valid_mask, :] = np.nan
-
-    # Number of channels above threshold. We probably need to tune this per rat? I don't know if each rat always has >90% above thrhoesl. 
-    n_channels_above_threshold = np.sum(ratio_short_long > ratio_threshold, axis=1)
-    spike_window = n_channels_above_threshold >= num_channels
-    spike_window[~valid_mask] = False
-
-    # Convert duration into # of consecutive windows to meet criteria for a seizure
-    step_sec = short_hop_samples / lfp_sample_rate
-    duration_windows = max(1, int(np.ceil(duration_threshold_sec / step_sec)))
-
-    # Counter for consecutive windows to meet criteria
-    seizure_window = np.zeros(n_short_windows, dtype=bool)
-    consecutive_count = np.zeros(n_short_windows, dtype=int)
-
-    run_len = 0
-    for i in range(n_short_windows):
-        if spike_window[i]:
-            run_len += 1
-        else:
-            run_len = 0
-        consecutive_count[i] = run_len
-        seizure_window[i] = run_len >= duration_windows
-
-    # Get times of start and stop of each short window. 
-    index_vals = np.asarray(lfp_df.index, dtype=float)
-    short_start_time = index_vals[short_window_starts]
-    short_end_idx = np.minimum(short_window_starts + short_window_samples - 1, len(index_vals) - 1)
-    short_end_time = index_vals[short_end_idx]
-    short_center_time = 0.5 * (short_start_time + short_end_time)
-
-    # Save out
-    ratio_df = pd.DataFrame(ratio_short_long,
-                            index=pd.Index(short_center_time, name="window_center_time"), 
-                            columns=lfp_df.columns)
-
-    spike_window_df = pd.DataFrame({
-        "window_start_sample": short_window_starts,
-        "window_end_sample": short_window_starts + short_window_samples - 1,
-        "window_start_time": short_start_time,
-        "window_end_time": short_end_time,
-        "window_center_time": short_center_time,
-        "valid_long_window": valid_mask,
-        "n_channels_above_threshold": n_channels_above_threshold,
-        "spike_window": spike_window,
-        "consecutive_spike_windows": consecutive_count,
-        "seizure_window": seizure_window,
-    })
-
-    # Candidate seizure start/stop times. Merge ones that overlap. 
-    seizure_intervals = []
-    in_event = False
-    event_start_idx = None
-
-    for i, is_seiz in enumerate(seizure_window):
-        if is_seiz and not in_event:
-            in_event = True
-            event_start_idx = i
-        elif not is_seiz and in_event:
-            in_event =False
-            event_end_idx = i-1
-            seizure_intervals.append((event_start_idx, event_end_idx))
-
-    if in_event:
-        seizure_intervals.append((event_start_idx, n_short_windows - 1))
-
-    seizure_intervals_rows = []
-    for start_i, end_i in seizure_intervals:
-        seizure_intervals_rows.append({"start_window_idx": start_i, "end_window_idx": end_i,
-                                       "start_time": spike_window_df.loc[start_i, "window_start_time"],
-                                       "end_time": spike_window_df.loc[end_i, "window_end_time"],
-                                       "duration_sec": (spike_window_df.loc[end_i, "window_end_sample"] 
-                                                        - spike_window_df.loc[start_i, "window_start_sample"] + 1) / lfp_sample_rate})
-    seizure_intervals_df = pd.DataFrame(seizure_intervals_rows)
-
-    return {"ratio_df": ratio_df,
-            "short_ll_df": pd.DataFrame(short_ll,
-                                        index=pd.Index(short_center_time, name="window_center_time"),
-                                        columns=lfp_df.columns),
-            "long_ll_df": pd.DataFrame(long_ll,
-                                       index=pd.Index(short_center_time, name="window_center_time"),
-                                       columns=lfp_df.columns),
-            "spike_window_df": spike_window_df,
-            "seizure_intervals_df": seizure_intervals_df}
+    return {
+        "ratio_df": pd.DataFrame(
+            ratio, index=window_index, columns=lfp_df.columns
+        ),
+        "short_ll_df": pd.DataFrame(
+            short_ll, index=window_index, columns=lfp_df.columns
+        ),
+        "long_ll_df": pd.DataFrame(
+            long_ll, index=window_index, columns=lfp_df.columns
+        ),
+        "max_derivative_df": pd.DataFrame(
+            deriv, index=window_index, columns=lfp_df.columns
+        ),
+        "amplitude_df": pd.DataFrame(
+            amp, index=window_index, columns=lfp_df.columns
+        ),
+        "spike_window_df": pd.DataFrame({
+            "window_start_sample": starts,
+            "window_end_sample": starts + short_n - 1,
+            "window_start_time": start_time,
+            "window_end_time": end_time,
+            "window_center_time": center_time,
+            "valid_long_window": valid,
+            "n_channels_above_threshold": n_ratio,
+            "n_channels_above_derivative_threshold": n_deriv,
+            "n_channels_above_amplitude_threshold": n_amp,
+            "n_channels_meeting_spike_criteria": n_meeting,
+            "seizure_window": seizure_window,
+            "spike_window": spike_window,
+        }),
+        "spike_intervals_df": _event_intervals(
+            spike_window,
+            starts,
+            short_n,
+            index_vals,
+            lfp_sample_rate,
+        ),
+    }

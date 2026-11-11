@@ -1,3 +1,11 @@
-from .detector import seizure_detector_LL_shortlongtrend
+"""Line-length-based seizure and spike detectors."""
 
-__all__ = ["seizure_detector_LL_shortlongtrend"]
+from .detector import (
+    seizure_detector_LL_shortlongtrend,
+    spike_detector_LL_shortlongtrend,
+)
+
+__all__ = [
+    "seizure_detector_LL_shortlongtrend",
+    "spike_detector_LL_shortlongtrend",
+]

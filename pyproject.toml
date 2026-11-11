@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "seizure-detection-ll"
-version = "0.1.0"
-description = "Line-length short/long window seizure detector for multichannel LFP data"
+version = "0.2.0"
+description = "Line-length short/long window seizure and spike detectors for multichannel LFP data"
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [
@@ -14,4 +14,5 @@ authors = [
 dependencies = [
   "numpy>=1.24",
   "pandas>=2.0",
+  "scipy>=1.10",
 ]
